@@ -1,0 +1,9 @@
+.DS_Store
+Icon*
+SyncTask
+*.o
+*.out
+*.keystore
+*.idsig
+android/build/
+android/assets/
