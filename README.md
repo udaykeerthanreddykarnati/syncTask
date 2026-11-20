@@ -1,25 +1,26 @@
 # syncTask
 
-Minimal, zero-overhead macOS desktop task widget and companion Android app with bidirectional sync.
+Minimal, zero-overhead macOS desktop task widget and companion Android app with real-time bidirectional sync.
 
-Designed for users who want desktop reminders that stay in sync with their phone without cloud subscriptions, electron runtimes, or background battery drain.
+Designed for users who want desktop reminders synced with their phone without cloud subscriptions, Electron runtimes, or background battery drain.
 
 ## Overview
 
-- **macOS Widget**: A single-file AppKit desktop widget (`SyncTask.swift`). Sits stationary on the desktop icon layer with no dock icon, custom themes, and an embedded zero-overhead HTTP sync server (`Network.framework`).
-- **Android App & Widget**: A minimal native companion (`~21 KB` APK) featuring an Android home-screen widget (`RemoteViews`) and instant bidirectional task synchronization.
-- **No Dependencies**: No Node.js, Electron, CocoaPods, Gradle, or external accounts required.
+- **macOS Widget**: A single-file AppKit desktop widget (`SyncTask.swift`) with persistent window position, multi-monitor bounds clamping, single-instance lock, `Enter`/`Esc` shortcuts, custom themes, and an embedded token-authenticated HTTP + real-time SSE (`ntfy.sh`) sync engine.
+- **Conflict-Safe Merging**: Tasks sync per-UUID with `updatedAt` timestamps and soft-delete tombstones so simultaneous Mac and phone edits merge cleanly.
+- **Android App & Widget**: A minimal native companion (`~21 KB` APK) with an Android home-screen widget (`RemoteViews`) and live SSE sync.
+- **No Dependencies**: Zero Node.js, Electron, CocoaPods, Gradle, or third-party packages.
 
 ## Project Structure
 
-```
+```text
 syncTask/
-├── SyncTask.swift        # Single-file macOS AppKit desktop widget and embedded sync server
-├── build-apk.sh          # Minimal APK build script using standard Android command-line tools
-├── synctask.apk          # Pre-built lightweight Android APK (~21 KB)
+├── SyncTask.swift        # macOS AppKit desktop widget + authenticated LAN & SSE sync server
+├── build-apk.sh          # Zero-Gradle APK build script (persists local signing keystore)
+├── synctask.apk          # Pre-built lightweight Android APK
 ├── android/              # Android source code and resource layouts
 │   ├── AndroidManifest.xml
-│   ├── res/              # Layout XMLs for the app and home-screen widget
+│   ├── res/
 │   └── src/app/synctask/sync/
 │       ├── MainActivity.java
 │       └── SyncTaskWidgetProvider.java
@@ -31,38 +32,34 @@ syncTask/
 
 ### 1. Run on macOS
 
-Compile with standard Apple clang / swiftc:
-
 ```bash
-swiftc -O SyncTask.swift -framework AppKit -framework Network -o syncTask
-./syncTask &
+swiftc -O SyncTask.swift -framework AppKit -framework CoreImage -framework Network -framework Security -o SyncTask
+./SyncTask &
 ```
 
-- Drag the widget anywhere on your desktop.
-- Click **Theme** to cycle color palettes (Minimal, Glass, Childish).
-- Double-click any task to edit inline.
-- Click **Sync** at the bottom-right to reveal the connection panel and pairing QR code.
+- Drag the widget anywhere on your desktop (position is saved automatically).
+- Press **+ Add** (`Enter` to add, `Esc` to cancel) or double-click any task to edit inline.
+- Click **Theme** to cycle color palettes (`Minimal`, `Glass`, `Childish`).
+- Click **Sync** at the bottom-right to show the pairing QR code and 128-bit random Sync Key.
 
 ### 2. Run on Android
 
-Transfer or download `synctask.apk` to your Android device, or compile from source using Android command-line tools:
+Transfer `synctask.apk` to your Android device, or compile from source using standard Android SDK build tools:
 
 ```bash
 chmod +x build-apk.sh
 ./build-apk.sh
 ```
 
-- Install `synctask.apk`.
-- Add the **syncTask** widget to your Android home screen.
-- Tasks synced between your Mac and phone stay updated in both directions.
+`build-apk.sh` keeps a persistent local keystore (`synctask.keystore`, gitignored) so future APK updates install cleanly in-place without wiping your saved Sync Key.
 
 ## Specifications
 
 | Component | macOS Widget | Android App / Widget |
 | :--- | :--- | :--- |
 | **Runtime** | Native AppKit / Swift | Native Android SDK (Java) |
+| **Sync Transport** | Real-time SSE (`ntfy.sh`) + Authenticated LAN HTTP | Real-time SSE + `RemoteViews` polling |
 | **Idle Memory** | ~15 MB | 0 MB (system-rendered widget) |
-| **Binary Size** | ~120 KB executable | ~21 KB APK |
 | **Dependencies** | None (OS-native frameworks) | None |
 
 ## License

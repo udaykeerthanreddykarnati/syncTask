@@ -38,16 +38,19 @@ CLASS_FILES=($BUILD_DIR/obj/app/synctask/sync/*.class)
 
 "$BUILD_TOOLS/zipalign" -f 4 "$BUILD_DIR/unaligned.apk" "$BUILD_DIR/aligned.apk"
 
-KEYSTORE="$BUILD_DIR/release.keystore"
-keytool -genkeypair -v \
-  -keystore "$KEYSTORE" \
-  -storepass android \
-  -keypass android \
-  -alias synctask \
-  -keyalg RSA \
-  -keysize 2048 \
-  -validity 10000 \
-  -dname "CN=synctask,O=synctask,C=US" >/dev/null 2>&1
+# Persist a local signing keystore (gitignored via *.keystore) so APK updates install in-place without losing saved settings.
+KEYSTORE="${SYNCTASK_KEYSTORE:-$DIR/synctask.keystore}"
+if [[ ! -f "$KEYSTORE" ]]; then
+  keytool -genkeypair -v \
+    -keystore "$KEYSTORE" \
+    -storepass android \
+    -keypass android \
+    -alias synctask \
+    -keyalg RSA \
+    -keysize 2048 \
+    -validity 10000 \
+    -dname "CN=synctask,O=synctask,C=US" >/dev/null 2>&1
+fi
 
 "$BUILD_TOOLS/apksigner" sign \
   --ks "$KEYSTORE" \

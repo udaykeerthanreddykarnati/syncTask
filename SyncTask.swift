@@ -1,6 +1,8 @@
 import AppKit
+import CoreImage
 import Foundation
 import Network
+import Security
 
 // MARK: - Theme Configuration
 enum ThemePreset: String, CaseIterable {
@@ -112,9 +114,7 @@ final class ThemeManager {
         return currentPreset.accentColor
     }
 
-    var customFontName: String? {
-        defaults.string(forKey: "synctask_font_name")
-    }
+    var customFontName: String? { defaults.string(forKey: "synctask_font_name") }
 }
 
 var kBg: NSColor          { ThemeManager.shared.currentBgColor }
@@ -152,17 +152,19 @@ extension NSColor {
 
     func toHex() -> String {
         guard let rgb = usingColorSpace(.sRGB) else { return "#000000" }
-        return String(format: "#%02X%02X%02X", Int(rgb.redComponent * 255), Int(rgb.greenComponent * 255), Int(rgb.blueComponent * 255))
+        return String(format: "#%02X%02X%02X", Int(round(rgb.redComponent * 255)), Int(round(rgb.greenComponent * 255)), Int(round(rgb.blueComponent * 255)))
     }
 }
 
-// MARK: - Task Model & Store
+// MARK: - Task Model & Atomic Conflict-Safe Store
 struct Reminder: Codable {
     var id: UUID
     var title: String
     var isCompleted: Bool
     var isStarred: Bool
     var createdAt: Date
+    var updatedAt: Double
+    var isDeleted: Bool
 
     init(title: String) {
         self.id = UUID()
@@ -170,6 +172,23 @@ struct Reminder: Codable {
         self.isCompleted = false
         self.isStarred = false
         self.createdAt = Date()
+        self.updatedAt = Date().timeIntervalSince1970 * 1000.0
+        self.isDeleted = false
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, isCompleted, isStarred, createdAt, updatedAt, isDeleted
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        isCompleted = try c.decode(Bool.self, forKey: .isCompleted)
+        isStarred = try c.decodeIfPresent(Bool.self, forKey: .isStarred) ?? false
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try c.decodeIfPresent(Double.self, forKey: .updatedAt) ?? (createdAt.timeIntervalSince1970 * 1000.0)
+        isDeleted = try c.decodeIfPresent(Bool.self, forKey: .isDeleted) ?? false
     }
 }
 
@@ -181,52 +200,124 @@ final class ReminderStore {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("reminders.json")
     }()
-    private(set) var items: [Reminder] = []
+    private(set) var allRecords: [Reminder] = []
+    var items: [Reminder] { allRecords.filter { !$0.isDeleted } }
+
     private init() { load() }
 
     func load() {
         guard let data = try? Data(contentsOf: url),
               let decoded = try? JSONDecoder().decode([Reminder].self, from: data) else { return }
-        items = decoded
+        allRecords = decoded
+        pruneOldTombstones()
     }
-    func save() {
-        try? JSONEncoder().encode(items).write(to: url)
-        SyncTaskServer.shared.pushCloudState()
+
+    func save(pushCloud: Bool = true) {
+        pruneOldTombstones()
+        if let data = try? JSONEncoder().encode(allRecords) {
+            try? data.write(to: url, options: .atomic)
+        }
+        if pushCloud { SyncTaskServer.shared.pushCloudState() }
     }
-    func replaceFromCloud(_ cloudItems: [Reminder]) {
-        items = cloudItems
-        try? JSONEncoder().encode(items).write(to: url)
+
+    /// Merges remote items per task UUID using `updatedAt` timestamps and tombstones.
+    func mergeFromCloud(_ cloudItems: [Reminder]) {
+        var byID = Dictionary(uniqueKeysWithValues: allRecords.map { ($0.id, $0) })
+        for remote in cloudItems {
+            if let local = byID[remote.id] {
+                if remote.updatedAt > local.updatedAt {
+                    byID[remote.id] = remote
+                }
+            } else if !remote.isDeleted {
+                byID[remote.id] = remote
+            }
+        }
+        allRecords = Array(byID.values).sorted { $0.createdAt < $1.createdAt }
+        save(pushCloud: false)
     }
-    func add(_ r: Reminder) { items.append(r); save() }
-    func toggle(id: UUID) { if let i = items.firstIndex(where: { $0.id == id }) { items[i].isCompleted.toggle(); save() } }
-    func toggleStar(id: UUID) { if let i = items.firstIndex(where: { $0.id == id }) { items[i].isStarred.toggle(); save() } }
-    func delete(id: UUID) { items.removeAll { $0.id == id }; save() }
-    func clearCompleted() { items.removeAll { $0.isCompleted }; save() }
-    func updateTitle(id: UUID, title: String) { if let i = items.firstIndex(where: { $0.id == id }) { items[i].title = title; save() } }
+
+    private func pruneOldTombstones() {
+        let cutoffMs = (Date().timeIntervalSince1970 - 7 * 24 * 3600) * 1000.0
+        allRecords.removeAll { $0.isDeleted && $0.updatedAt < cutoffMs }
+    }
+
+    func add(_ r: Reminder) { allRecords.append(r); save() }
+
+    func toggle(id: UUID) {
+        if let i = allRecords.firstIndex(where: { $0.id == id }) {
+            allRecords[i].isCompleted.toggle()
+            allRecords[i].updatedAt = Date().timeIntervalSince1970 * 1000.0
+            save()
+        }
+    }
+
+    func toggleStar(id: UUID) {
+        if let i = allRecords.firstIndex(where: { $0.id == id }) {
+            allRecords[i].isStarred.toggle()
+            allRecords[i].updatedAt = Date().timeIntervalSince1970 * 1000.0
+            save()
+        }
+    }
+
+    func delete(id: UUID) {
+        if let i = allRecords.firstIndex(where: { $0.id == id }) {
+            allRecords[i].isDeleted = true
+            allRecords[i].updatedAt = Date().timeIntervalSince1970 * 1000.0
+            save()
+        }
+    }
+
+    func clearCompleted() {
+        let nowMs = Date().timeIntervalSince1970 * 1000.0
+        for i in allRecords.indices where allRecords[i].isCompleted && !allRecords[i].isDeleted {
+            allRecords[i].isDeleted = true
+            allRecords[i].updatedAt = nowMs
+        }
+        save()
+    }
+
+    func updateTitle(id: UUID, title: String) {
+        if let i = allRecords.firstIndex(where: { $0.id == id }) {
+            allRecords[i].title = title
+            allRecords[i].updatedAt = Date().timeIntervalSince1970 * 1000.0
+            save()
+        }
+    }
 }
 
-// MARK: - Embedded Lightweight HTTP + Cloud Sync Server (0 MB Extra RAM)
-final class SyncTaskServer {
+// MARK: - Embedded Authenticated HTTP + Real-Time SSE Cloud Sync Server
+final class SyncTaskServer: NSObject, URLSessionDataDelegate {
     static let shared = SyncTaskServer()
     private var listener: NWListener?
-    private var cloudTimer: Timer?
-    private var lastAppliedTimestamp: Double = 0
-    private let queue = DispatchQueue(label: "app.synctask.syncserver", qos: .utility)
+    private var sseSession: URLSession?
+    private var sseTask: URLSessionDataTask?
+    private var sseBuffer = Data()
+    private var reconnectDelay: TimeInterval = 2.0
+    private var isSleeping = false
 
+    private let stateQueue = DispatchQueue(label: "app.synctask.syncstate")
+    private let netQueue = DispatchQueue(label: "app.synctask.syncserver", qos: .utility)
+    private var _lastAppliedTimestamp: Double = 0
+
+    /// 128-bit cryptographically random topic/pairing key (`synctask_<32 hex chars>`).
     var syncKey: String {
         get {
             if let k = UserDefaults.standard.string(forKey: "synctask_cloud_key"), !k.isEmpty { return k }
-            let generated = "synctask_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12).lowercased()
+            var bytes = [UInt8](repeating: 0, count: 16)
+            _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+            let generated = "synctask_" + bytes.map { String(format: "%02x", $0) }.joined()
             UserDefaults.standard.set(generated, forKey: "synctask_cloud_key")
             return generated
         }
         set {
             UserDefaults.standard.set(newValue, forKey: "synctask_cloud_key")
+            reconnectSSE()
         }
     }
 
     var cloudTopicURL: URL {
-        URL(string: "https://ntfy.sh/\(syncKey)")!
+        let encoded = syncKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? syncKey
+        return URL(string: "https://ntfy.sh/\(encoded)")!
     }
 
     func getLanIP() -> String {
@@ -255,75 +346,140 @@ final class SyncTaskServer {
     }
 
     func start() {
-        guard listener == nil else { return }
-        do {
-            let params = NWParameters.tcp
-            params.allowLocalEndpointReuse = true
-            let nwListener = try NWListener(using: params, on: 4321)
-            nwListener.newConnectionHandler = { [weak self] conn in self?.handleConnection(conn) }
-            nwListener.start(queue: queue)
-            listener = nwListener
-        } catch {}
-        startCloudSync()
+        if listener == nil {
+            do {
+                let params = NWParameters.tcp
+                params.allowLocalEndpointReuse = true
+                let nwListener = try NWListener(using: params, on: 4321)
+                nwListener.newConnectionHandler = { [weak self] conn in self?.handleConnection(conn) }
+                nwListener.start(queue: netQueue)
+                listener = nwListener
+            } catch {}
+        }
+
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(onSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(onWake), name: NSWorkspace.didWakeNotification, object: nil)
+
+        pushCloudState()
+        connectSSE()
     }
 
-    private func startCloudSync() {
+    @objc private func onSleep() {
+        isSleeping = true
+        sseTask?.cancel()
+        sseTask = nil
+    }
+
+    @objc private func onWake() {
+        isSleeping = false
+        reconnectDelay = 2.0
+        reconnectSSE()
+    }
+
+    // MARK: - Real-Time SSE Streaming via ntfy.sh (Replaces 2.5s Polling)
+    private func connectSSE() {
+        guard !isSleeping else { return }
+        sseTask?.cancel()
+        sseBuffer.removeAll(keepingCapacity: true)
+
+        if sseSession == nil {
+            let cfg = URLSessionConfiguration.default
+            cfg.timeoutIntervalForRequest = TimeInterval(Int.max)
+            cfg.timeoutIntervalForResource = TimeInterval(Int.max)
+            sseSession = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+        }
+
+        guard let url = URL(string: "\(cloudTopicURL.absoluteString)/sse?since=all") else { return }
+        var req = URLRequest(url: url)
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        let task = sseSession?.dataTask(with: req)
+        sseTask = task
+        task?.resume()
+    }
+
+    private func reconnectSSE() {
+        sseTask?.cancel()
+        sseTask = nil
+        connectSSE()
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        reconnectDelay = 2.0
+        sseBuffer.append(data)
+        while let newlineRange = sseBuffer.range(of: Data("\n".utf8)) {
+            let lineData = sseBuffer.subdata(in: 0..<newlineRange.lowerBound)
+            sseBuffer.removeSubrange(0..<newlineRange.upperBound)
+            guard let line = String(data: lineData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  line.hasPrefix("data:") else { continue }
+            let jsonText = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
+            handleSSEPayload(jsonText)
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard !isSleeping else { return }
+        let delay = reconnectDelay
+        reconnectDelay = min(reconnectDelay * 2.0, 60.0)
+        netQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.connectSSE()
+        }
+    }
+
+    private func handleSSEPayload(_ rawEvent: String) {
+        guard let eventData = rawEvent.data(using: .utf8),
+              let wrapper = (try? JSONSerialization.jsonObject(with: eventData)) as? [String: Any],
+              (wrapper["event"] as? String) == "message",
+              let msgStr = wrapper["message"] as? String,
+              let msgData = msgStr.data(using: .utf8),
+              let json = (try? JSONSerialization.jsonObject(with: msgData)) as? [String: Any] else { return }
+
+        let source = (json["source"] as? String) ?? ""
+        let updatedAt = (json["updatedAt"] as? Double) ?? 0
+        guard source == "phone", let arr = json["reminders"] as? [[String: Any]] else { return }
+
+        let shouldApply: Bool = stateQueue.sync {
+            guard updatedAt > _lastAppliedTimestamp else { return false }
+            _lastAppliedTimestamp = updatedAt
+            return true
+        }
+        guard shouldApply else { return }
+
+        var decoded: [Reminder] = []
+        for item in arr {
+            guard let title = (item["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !title.isEmpty else { continue }
+            var r = Reminder(title: title)
+            if let idStr = item["id"] as? String, let uuid = UUID(uuidString: idStr) { r.id = uuid }
+            if let done = item["isCompleted"] as? Bool { r.isCompleted = done }
+            if let starred = item["isStarred"] as? Bool { r.isStarred = starred }
+            if let deleted = item["isDeleted"] as? Bool { r.isDeleted = deleted }
+            if let ts = item["createdAt"] as? Double { r.createdAt = Date(timeIntervalSinceReferenceDate: ts) }
+            if let upd = item["updatedAt"] as? Double { r.updatedAt = upd }
+            decoded.append(r)
+        }
         DispatchQueue.main.async {
-            self.pushCloudState()
-            self.cloudTimer?.invalidate()
-            self.cloudTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
-                self?.pullCloudState()
-            }
+            ReminderStore.shared.mergeFromCloud(decoded)
+            NotificationCenter.default.post(name: NSNotification.Name("app.synctask.reload"), object: nil)
         }
     }
 
     func pushCloudState() {
         let nowMs = Date().timeIntervalSince1970 * 1000.0
-        lastAppliedTimestamp = max(lastAppliedTimestamp, nowMs)
-        let data = buildStateJSON(source: "mac", updatedAt: nowMs)
-        var req = URLRequest(url: cloudTopicURL)
-        req.httpMethod = "POST"
-        req.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        req.httpBody = data
-        URLSession.shared.dataTask(with: req).resume()
+        stateQueue.async { self._lastAppliedTimestamp = max(self._lastAppliedTimestamp, nowMs) }
+        DispatchQueue.main.async {
+            let data = self.buildStateJSON(source: "mac", updatedAt: nowMs)
+            var req = URLRequest(url: self.cloudTopicURL)
+            req.httpMethod = "POST"
+            req.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
+            req.httpBody = data
+            URLSession.shared.dataTask(with: req).resume()
+        }
     }
 
-    private func pullCloudState() {
-        guard let pollURL = URL(string: "\(cloudTopicURL.absoluteString)/raw?poll=1&since=all") else { return }
-        var req = URLRequest(url: pollURL)
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
-            guard let self = self, err == nil, let data = data,
-                  let text = String(data: data, encoding: .utf8) else { return }
-            let lines = text.split(whereSeparator: \.isNewline)
-            guard let lastLine = lines.last,
-                  let lineData = String(lastLine).data(using: .utf8),
-                  let json = (try? JSONSerialization.jsonObject(with: lineData)) as? [String: Any] else { return }
-            let source = (json["source"] as? String) ?? ""
-            let updatedAt = (json["updatedAt"] as? Double) ?? 0
-            guard source == "phone", updatedAt > self.lastAppliedTimestamp,
-                  let arr = json["reminders"] as? [[String: Any]] else { return }
-            self.lastAppliedTimestamp = updatedAt
-            var decoded: [Reminder] = []
-            for item in arr {
-                guard let title = (item["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !title.isEmpty else { continue }
-                var r = Reminder(title: title)
-                if let idStr = item["id"] as? String, let uuid = UUID(uuidString: idStr) { r.id = uuid }
-                if let done = item["isCompleted"] as? Bool { r.isCompleted = done }
-                if let starred = item["isStarred"] as? Bool { r.isStarred = starred }
-                if let ts = item["createdAt"] as? Double { r.createdAt = Date(timeIntervalSinceReferenceDate: ts) }
-                decoded.append(r)
-            }
-            DispatchQueue.main.async {
-                ReminderStore.shared.replaceFromCloud(decoded)
-                NotificationCenter.default.post(name: NSNotification.Name("app.synctask.reload"), object: nil)
-            }
-        }.resume()
-    }
-
+    // MARK: - Authenticated Local HTTP Server
     private func handleConnection(_ conn: NWConnection) {
-        conn.start(queue: queue)
+        conn.start(queue: netQueue)
         receiveFullRequest(conn: conn, accumulated: Data())
     }
 
@@ -339,7 +495,7 @@ final class SyncTaskServer {
                 var contentLength = 0
                 for line in headerStr.components(separatedBy: "\r\n") {
                     if line.lowercased().hasPrefix("content-length:") {
-                        contentLength = Int(line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)) ?? 0
+                        contentLength = min(Int(line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)) ?? 0, 512 * 1024)
                     }
                 }
                 if bodyData.count < contentLength && !isComplete && error == nil {
@@ -355,15 +511,41 @@ final class SyncTaskServer {
         }
     }
 
+    private func extractHeaders(_ headerStr: String) -> [String: String] {
+        var out: [String: String] = [:]
+        for line in headerStr.components(separatedBy: "\r\n").dropFirst() {
+            if let idx = line.firstIndex(of: ":") {
+                out[line[..<idx].trimmingCharacters(in: .whitespaces).lowercased()] = line[line.index(after: idx)...].trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return out
+    }
+
+    private func queryParam(_ name: String, in rawPath: String) -> String? {
+        guard let comps = URLComponents(string: "http://localhost\(rawPath)"),
+              let items = comps.queryItems else { return nil }
+        return items.first(where: { $0.name == name })?.value
+    }
+
+    private func isAuthorized(headers: [String: String], rawPath: String) -> Bool {
+        let key = syncKey
+        if let hdr = headers["x-sync-key"], hdr == key { return true }
+        if let auth = headers["authorization"], auth == "Bearer \(key)" { return true }
+        if let q = queryParam("key", in: rawPath), q == key { return true }
+        return false
+    }
+
     private func buildStateJSON(source: String = "mac", updatedAt: Double = Date().timeIntervalSince1970 * 1000.0) -> Data {
         let p = ThemeManager.shared.currentPreset
-        let remindersArray: [[String: Any]] = ReminderStore.shared.items.map { r in
+        let remindersArray: [[String: Any]] = ReminderStore.shared.allRecords.map { r in
             [
                 "id": r.id.uuidString.uppercased(),
                 "title": r.title,
                 "isCompleted": r.isCompleted,
                 "isStarred": r.isStarred,
-                "createdAt": r.createdAt.timeIntervalSinceReferenceDate
+                "isDeleted": r.isDeleted,
+                "createdAt": r.createdAt.timeIntervalSinceReferenceDate,
+                "updatedAt": r.updatedAt
             ]
         }
         let payload: [String: Any] = [
@@ -390,10 +572,16 @@ final class SyncTaskServer {
         let parts = firstLine.components(separatedBy: " ")
         guard parts.count >= 2 else { conn.cancel(); return }
         let method = parts[0].uppercased()
-        let pathOnly = parts[1].components(separatedBy: "?").first ?? "/"
+        let rawPath = parts[1]
+        let pathOnly = rawPath.components(separatedBy: "?").first ?? "/"
+        let headers = extractHeaders(headerStr)
 
         if method == "OPTIONS" {
             sendResponse(conn: conn, status: "204 No Content", contentType: "text/plain", body: Data())
+            return
+        }
+        if pathOnly.hasPrefix("/api/") && !isAuthorized(headers: headers, rawPath: rawPath) {
+            sendResponse(conn: conn, status: "401 Unauthorized", contentType: "application/json; charset=utf-8", body: Data("{\"error\":\"unauthorized\"}".utf8))
             return
         }
         if method == "GET" && pathOnly == "/api/state" {
@@ -448,11 +636,7 @@ final class SyncTaskServer {
         if method == "GET" && pathOnly == "/synctask.apk" {
             let execDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
             let cwdDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            let candidates = [
-                cwdDir.appendingPathComponent("synctask.apk"),
-                execDir.appendingPathComponent("synctask.apk")
-            ]
-            for url in candidates {
+            for url in [cwdDir.appendingPathComponent("synctask.apk"), execDir.appendingPathComponent("synctask.apk")] {
                 if let apkData = try? Data(contentsOf: url) {
                     sendResponse(
                         conn: conn,
@@ -478,9 +662,7 @@ final class SyncTaskServer {
         let header = "HTTP/1.1 \(status)\r\n" +
                      "Content-Type: \(contentType)\r\n" +
                      "Content-Length: \(body.count)\r\n" +
-                     "Access-Control-Allow-Origin: *\r\n" +
-                     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
-                     "Access-Control-Allow-Headers: Content-Type\r\n" +
+                     "X-Content-Type-Options: nosniff\r\n" +
                      "Cache-Control: no-store\r\n" +
                      extraHeaders +
                      "Connection: close\r\n\r\n"
@@ -511,115 +693,37 @@ final class SyncTaskServer {
   --font: monospace, sans-serif;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font);
-  min-height: 100dvh;
-  padding: 14px;
-  display: flex;
-  flex-direction: column;
-}
+body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100dvh; padding: 14px; display: flex; flex-direction: column; }
 .bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .title-wrap { display: flex; align-items: center; gap: 8px; }
 h1 { font-size: 18px; font-weight: 700; }
-.badge {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  font-size: 11px;
-  font-weight: 700;
-  padding: 2px 7px;
-}
-.btn {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  font-family: var(--font);
-  font-size: 12px;
-  font-weight: 700;
-  padding: 6px 12px;
-  cursor: pointer;
-}
+.badge { background: var(--surface); color: var(--text); border: 1px solid var(--border); font-size: 11px; font-weight: 700; padding: 2px 7px; }
+.btn { background: var(--surface); color: var(--text); border: 1px solid var(--border); font-family: var(--font); font-size: 12px; font-weight: 700; padding: 6px 12px; cursor: pointer; }
 .btn-primary { background: var(--add-bg); color: var(--add-text); }
 .tabs { display: grid; grid-template-columns: 1fr 1fr; margin-bottom: 10px; }
-.tab {
-  background: transparent;
-  color: var(--text);
-  border: 1px solid var(--border);
-  font-family: var(--font);
-  font-size: 12px;
-  padding: 6px;
-  cursor: pointer;
-}
+.tab { background: transparent; color: var(--text); border: 1px solid var(--border); font-family: var(--font); font-size: 12px; padding: 6px; cursor: pointer; }
 .tab.active { background: var(--surface); font-weight: 700; }
 .list { flex: 1; display: flex; flex-direction: column; gap: 5px; overflow-y: auto; }
-.row {
-  background: var(--surface);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  min-height: 38px;
-}
+.row { background: var(--surface); display: flex; align-items: center; gap: 8px; padding: 8px 10px; min-height: 38px; }
 .row.starred { border: 1.5px solid #F59E0B; }
-.check {
-  width: 20px; height: 20px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: #FFFFFF;
-  font-size: 11px;
-  font-weight: 700;
-  cursor: pointer;
-}
+.check { width: 20px; height: 20px; border: 1px solid var(--border); background: transparent; color: #FFFFFF; font-size: 11px; font-weight: 700; cursor: pointer; }
 .row.done .check { background: var(--border); }
 .row-title { flex: 1; font-size: 13px; font-weight: 500; word-break: break-word; cursor: pointer; }
 .row.starred .row-title { color: #F59E0B; font-weight: 700; }
 .row.done .row-title { color: var(--dim); text-decoration: line-through; }
-.star, .del {
-  width: 24px; height: 24px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--dim);
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-}
+.star, .del { width: 24px; height: 24px; border: 1px solid var(--border); background: transparent; color: var(--dim); font-size: 12px; font-weight: 700; cursor: pointer; }
 .row.starred .star { background: #F59E0B; border-color: #D97706; color: #FFFFFF; }
 .del { border: none; }
 .footer { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; padding-top: 6px; font-size: 11px; }
 .link-btn { background: none; border: none; color: var(--text); font-family: var(--font); font-size: 11px; cursor: pointer; }
 .status { color: var(--dim); font-size: 10px; cursor: pointer; text-decoration: underline; }
-.modal {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.65);
-  display: flex; align-items: center; justify-content: center; padding: 16px;
-}
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,0.65); display: flex; align-items: center; justify-content: center; padding: 16px; }
 .modal[hidden] { display: none; }
-.panel {
-  width: 100%; max-width: 340px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  padding: 14px;
-}
+.panel { width: 100%; max-width: 340px; background: var(--bg); border: 1px solid var(--border); padding: 14px; }
 .panel-label { font-size: 11px; font-weight: 700; margin-bottom: 6px; display: block; }
-.input {
-  width: 100%;
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  font-family: var(--font);
-  font-size: 14px;
-  font-weight: 700;
-  padding: 8px 10px;
-  margin-bottom: 12px;
-  outline: none;
-}
+.input { width: 100%; background: var(--surface); color: var(--text); border: 1px solid var(--border); font-family: var(--font); font-size: 14px; font-weight: 700; padding: 8px 10px; margin-bottom: 12px; outline: none; }
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.apk-bar {
-  display: flex; align-items: center; justify-content: space-between;
-  background: var(--surface); border: 1px solid var(--border);
-  padding: 6px 10px; margin-bottom: 10px; font-size: 11px;
-}
+.apk-bar { display: flex; align-items: center; justify-content: space-between; background: var(--surface); border: 1px solid var(--border); padding: 6px 10px; margin-bottom: 10px; font-size: 11px; }
 .apk-bar a { color: var(--text); font-weight: 700; text-decoration: none; }
 </style>
 </head>
@@ -642,7 +746,7 @@ h1 { font-size: 18px; font-weight: 700; }
 <div class="list" id="list"></div>
 <div class="footer">
   <button class="link-btn" id="clearBtn" type="button">Clear Done</button>
-  <span class="status" id="status" title="Tap to configure Mac IP">Host: Auto</span>
+  <span class="status" id="status" title="Tap to configure Sync Key">Sync Key: Tap</span>
 </div>
 <div class="modal" id="modal" hidden>
   <form class="panel" id="form">
@@ -670,6 +774,7 @@ h1 { font-size: 18px; font-weight: 700; }
     if (window.SyncTaskNative && window.SyncTaskNative.setMacHost) {
       window.SyncTaskNative.setMacHost(urlParams.get('key'));
     }
+    if (!isNative) window.history.replaceState({}, '', '/');
   }
 
   function getSyncKey() {
@@ -689,6 +794,7 @@ h1 { font-size: 18px; font-weight: 700; }
   let tab = 0;
   let modalMode = 'add';
   let editId = null;
+  let eventSource = null;
 
   try {
     const cached = JSON.parse(localStorage.getItem('synctask_state') || 'null');
@@ -710,6 +816,18 @@ h1 { font-size: 18px; font-weight: 700; }
   document.getElementById('cancelBtn').onclick = () => { modal.hidden = true; };
   document.getElementById('clearBtn').onclick = () => mutate({ type: 'CLEAR_COMPLETED' });
   statusEl.onclick = () => openModal('host', null);
+
+  function mergeReminders(localArr, remoteArr) {
+    const byId = new Map();
+    for (const r of (localArr || [])) byId.set(r.id, r);
+    for (const r of (remoteArr || [])) {
+      const prev = byId.get(r.id);
+      const rUpd = r.updatedAt || 0;
+      const pUpd = prev ? (prev.updatedAt || 0) : -1;
+      if (!prev || rUpd >= pUpd) byId.set(r.id, r);
+    }
+    return Array.from(byId.values());
+  }
 
   function openModal(mode, item) {
     modalMode = mode;
@@ -740,20 +858,16 @@ h1 { font-size: 18px; font-weight: 700; }
       if (window.SyncTaskNative && window.SyncTaskNative.setMacHost) {
         window.SyncTaskNative.setMacHost(clean);
       }
-      pull();
+      connectStream();
       return;
     }
     if (editId) mutate({ type: 'UPDATE_REMINDER', id: editId, title: val });
     else mutate({ type: 'ADD_REMINDER', item: { title: val, isStarred: false } });
   };
 
-  function applyTheme(t) {
-    document.getElementById('metaTheme').content = '#000000';
-  }
-
   function render() {
-    applyTheme(state.theme);
-    const items = Array.isArray(state.reminders) ? state.reminders : [];
+    document.getElementById('metaTheme').content = '#000000';
+    const items = (Array.isArray(state.reminders) ? state.reminders : []).filter(i => !i.isDeleted);
     const activeCount = items.filter(i => !i.isCompleted).length;
     badgeEl.textContent = activeCount;
     badgeEl.style.display = activeCount ? 'inline-block' : 'none';
@@ -794,59 +908,57 @@ h1 { font-size: 18px; font-weight: 700; }
     }
   }
 
-  async function pull() {
-    if (document.visibilityState === 'hidden') return;
+  function applyRemoteState(data) {
+    if (!data || !Array.isArray(data.reminders)) return;
+    state = { ...data, reminders: mergeReminders(state.reminders, data.reminders) };
+    localStorage.setItem('synctask_state', JSON.stringify(state));
+    statusEl.textContent = 'Live Cloud Sync';
+    render();
+  }
+
+  function connectStream() {
+    if (eventSource) { eventSource.close(); eventSource = null; }
     const cloud = getCloudUrl();
-    if (!cloud) {
-      statusEl.textContent = 'Tap to set Sync Key';
-      return;
-    }
-    try {
-      const res = await fetch(cloud + '/raw?poll=1&since=all&_t=' + Date.now(), { cache: 'no-store' });
-      const text = await res.text();
-      const lines = text.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);
-      for (let i = lines.length - 1; i >= 0; i--) {
+    if (!cloud) { statusEl.textContent = 'Tap to set Sync Key'; return; }
+    if (typeof EventSource !== 'undefined') {
+      eventSource = new EventSource(cloud + '/sse?since=all');
+      eventSource.onmessage = (ev) => {
         try {
-          const data = JSON.parse(lines[i]);
-          if (data && Array.isArray(data.reminders)) {
-            state = data;
-            localStorage.setItem('synctask_state', JSON.stringify(state));
-            statusEl.textContent = 'Cloud Synced (Any Wi-Fi / 5G)';
-            render();
-            break;
-          }
+          const envelope = JSON.parse(ev.data);
+          if (envelope && envelope.message) applyRemoteState(JSON.parse(envelope.message));
         } catch (_) {}
-      }
-    } catch (_) {
-      statusEl.textContent = 'Offline (Tap to set Sync Key)';
+      };
+      eventSource.onopen = () => { statusEl.textContent = 'Live Cloud Sync'; };
+      eventSource.onerror = () => { statusEl.textContent = 'Reconnecting...'; };
     }
   }
 
   async function mutate(payload) {
     const items = Array.isArray(state.reminders) ? state.reminders.map(r => ({ ...r })) : [];
     const type = payload.type;
+    const nowMs = Date.now();
     if (type === 'ADD_REMINDER' && payload.item && payload.item.title) {
       const id = (crypto.randomUUID ? crypto.randomUUID() : ('xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
         const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
         return v.toString(16);
       }))).toUpperCase();
-      items.push({ id, title: payload.item.title.trim(), isCompleted: false, isStarred: Boolean(payload.item.isStarred), createdAt: (Date.now() / 1000) - 978307200 });
+      items.push({ id, title: payload.item.title.trim(), isCompleted: false, isStarred: Boolean(payload.item.isStarred), isDeleted: false, createdAt: (nowMs / 1000) - 978307200, updatedAt: nowMs });
     } else if (type === 'TOGGLE_REMINDER') {
       const idx = items.findIndex(r => r.id === payload.id);
-      if (idx >= 0) items[idx].isCompleted = !items[idx].isCompleted;
+      if (idx >= 0) { items[idx].isCompleted = !items[idx].isCompleted; items[idx].updatedAt = nowMs; }
     } else if (type === 'TOGGLE_STAR') {
       const idx = items.findIndex(r => r.id === payload.id);
-      if (idx >= 0) items[idx].isStarred = !items[idx].isStarred;
+      if (idx >= 0) { items[idx].isStarred = !items[idx].isStarred; items[idx].updatedAt = nowMs; }
     } else if (type === 'UPDATE_REMINDER') {
       const idx = items.findIndex(r => r.id === payload.id);
-      if (idx >= 0 && payload.title) items[idx].title = payload.title.trim();
+      if (idx >= 0 && payload.title) { items[idx].title = payload.title.trim(); items[idx].updatedAt = nowMs; }
     } else if (type === 'DELETE_REMINDER') {
       const idx = items.findIndex(r => r.id === payload.id);
-      if (idx >= 0) items.splice(idx, 1);
+      if (idx >= 0) { items[idx].isDeleted = true; items[idx].updatedAt = nowMs; }
     } else if (type === 'CLEAR_COMPLETED') {
-      for (let i = items.length - 1; i >= 0; i--) { if (items[i].isCompleted) items.splice(i, 1); }
+      for (const r of items) { if (r.isCompleted && !r.isDeleted) { r.isDeleted = true; r.updatedAt = nowMs; } }
     }
-    state = { ...state, source: 'phone', updatedAt: Date.now(), reminders: items };
+    state = { ...state, source: 'phone', updatedAt: nowMs, reminders: items };
     localStorage.setItem('synctask_state', JSON.stringify(state));
     render();
     if (window.SyncTaskNative && window.SyncTaskNative.refreshHomeWidget) {
@@ -860,20 +972,18 @@ h1 { font-size: 18px; font-weight: 700; }
         headers: { 'Content-Type': 'text/plain; charset=utf-8' },
         body: JSON.stringify(state)
       });
-      statusEl.textContent = 'Cloud Synced (Any Wi-Fi / 5G)';
+      statusEl.textContent = 'Live Cloud Sync';
     } catch (_) {
       statusEl.textContent = 'Offline';
     }
   }
 
   render();
-  if (!getSyncKey() && isNative) {
-    openModal('host', null);
-  } else {
-    pull();
-  }
-  setInterval(pull, 2500);
-  document.addEventListener('visibilitychange', pull);
+  if (!getSyncKey() && isNative) openModal('host', null);
+  else connectStream();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && (!eventSource || eventSource.readyState === 2)) connectStream();
+  });
 })();
 </script>
 </body>
@@ -939,7 +1049,7 @@ final class ReminderRowView: NSView {
 
         if reminder.isCompleted {
             let s = NSMutableAttributedString(string: reminder.title)
-            let r = NSRange(location: 0, length: reminder.title.count)
+            let r = NSRange(location: 0, length: reminder.title.utf16.count)
             s.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: r)
             s.addAttribute(.foregroundColor, value: kDim, range: r)
             label.attributedStringValue = s
@@ -989,10 +1099,11 @@ final class ReminderRowView: NSView {
             let t = tf.stringValue.trimmingCharacters(in: .whitespaces)
             if !t.isEmpty { self.onEdit?(self.reminder.id, t) }
         }
+        DispatchQueue.main.async { tf.becomeFirstResponder() }
     }
 }
 
-final class AddPanel: NSView {
+final class AddPanel: NSView, NSTextFieldDelegate {
     var onAdd:    ((Reminder) -> Void)?
     var onCancel: (() -> Void)?
 
@@ -1008,14 +1119,18 @@ final class AddPanel: NSView {
         titleField.drawsBackground = true
         titleField.font = dynamicFont(size: 13, weight: .bold); titleField.focusRingType = .none
         titleField.isBordered = true; titleField.bezelStyle = .squareBezel
+        titleField.delegate = self
+        titleField.placeholderString = "What to do? (Enter to add)"
         addSubview(titleField)
 
         addBtn.title = "Add"; addBtn.isBordered = false; addBtn.wantsLayer = true
         addBtn.font = dynamicFont(size: 12, weight: .bold)
+        addBtn.keyEquivalent = "\r"
         addBtn.target = self; addBtn.action = #selector(addTapped); addSubview(addBtn)
 
         cancelBtn.title = "Cancel"; cancelBtn.isBordered = false; cancelBtn.wantsLayer = true
         cancelBtn.font = dynamicFont(size: 12, weight: .bold)
+        cancelBtn.keyEquivalent = "\u{1b}"
         cancelBtn.target = self; cancelBtn.action = #selector(cancelTapped); addSubview(cancelBtn)
         refreshTheme()
     }
@@ -1041,6 +1156,20 @@ final class AddPanel: NSView {
     }
 
     func clear() { titleField.stringValue = "" }
+
+    func focusField() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.window?.makeKey()
+            self.window?.makeFirstResponder(self.titleField)
+        }
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) { addTapped(); return true }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) { cancelTapped(); return true }
+        return false
+    }
 
     @objc private func addTapped() {
         let t = titleField.stringValue.trimmingCharacters(in: .whitespaces)
@@ -1078,10 +1207,11 @@ final class PhoneQRPanel: NSView {
 
         urlLabel.font = dynamicFont(size: 9, weight: .bold)
         urlLabel.alignment = .center
+        urlLabel.lineBreakMode = .byTruncatingMiddle
         urlLabel.isEditable = false; urlLabel.isBordered = false; urlLabel.backgroundColor = .clear
         addSubview(urlLabel)
 
-        copyBtn.title = "Copy URL"; copyBtn.isBordered = false; copyBtn.wantsLayer = true
+        copyBtn.title = "Copy Key"; copyBtn.isBordered = false; copyBtn.wantsLayer = true
         copyBtn.font = dynamicFont(size: 11, weight: .bold)
         copyBtn.target = self; copyBtn.action = #selector(copyTapped)
         addSubview(copyBtn)
@@ -1110,7 +1240,7 @@ final class PhoneQRPanel: NSView {
         let ip = SyncTaskServer.shared.getLanIP()
         let key = SyncTaskServer.shared.syncKey
         currentUrl = "http://\(ip):4321/?key=\(key)"
-        urlLabel.stringValue = "Sync Key: \(key)"
+        urlLabel.stringValue = "Key: \(key)"
         if let data = currentUrl.data(using: .utf8),
            let filter = CIFilter(name: "CIQRCodeGenerator") {
             filter.setValue(data, forKey: "inputMessage")
@@ -1138,7 +1268,11 @@ final class PhoneQRPanel: NSView {
 
     @objc private func copyTapped() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(currentUrl, forType: .string)
+        NSPasteboard.general.setString(SyncTaskServer.shared.syncKey, forType: .string)
+        copyBtn.title = "Copied!"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.copyBtn.title = "Copy Key"
+        }
     }
     @objc private func closeTapped() { onClose?() }
 }
@@ -1219,11 +1353,13 @@ final class TodoView: NSView {
 
         scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false; scroll.documentView = list; addSubview(scroll)
 
-        panel.isHidden = true; panel.onAdd = { [weak self] r in ReminderStore.shared.add(r); self?.panel.isHidden = true; self?.panelShown = false; self?.reload() }
+        panel.isHidden = true
+        panel.onAdd = { [weak self] r in ReminderStore.shared.add(r); self?.panel.isHidden = true; self?.panelShown = false; self?.reload() }
         panel.onCancel = { [weak self] in self?.panel.isHidden = true; self?.panelShown = false }
         addSubview(panel)
 
-        qrPanel.isHidden = true; qrPanel.onClose = { [weak self] in self?.qrPanel.isHidden = true; self?.qrShown = false }
+        qrPanel.isHidden = true
+        qrPanel.onClose = { [weak self] in self?.qrPanel.isHidden = true; self?.qrShown = false }
         addSubview(qrPanel)
 
         applyThemeColors()
@@ -1271,7 +1407,7 @@ final class TodoView: NSView {
 
     @objc private func activeTabTapped() { filterIdx = 0; reload() }
     @objc private func doneTabTapped()   { filterIdx = 1; reload() }
-    @objc private func showPanel()       { qrPanel.isHidden = true; qrShown = false; panelShown = true; panel.clear(); panel.isHidden = false }
+    @objc private func showPanel()       { qrPanel.isHidden = true; qrShown = false; panelShown = true; panel.clear(); panel.isHidden = false; panel.focusField() }
     @objc private func toggleQRPanel()   { panel.isHidden = true; panelShown = false; qrShown.toggle(); qrPanel.refreshQR(); qrPanel.isHidden = !qrShown }
     @objc private func cycleTheme()      { ThemeManager.shared.cyclePreset() }
     @objc private func clearDone()       { ReminderStore.shared.clearCompleted(); reload() }
@@ -1331,7 +1467,12 @@ final class TodoView: NSView {
         let c = NSEvent.mouseLocation
         w.setFrameOrigin(NSPoint(x: initialWinOrigin.x + (c.x - dragStart.x), y: initialWinOrigin.y + (c.y - dragStart.y)))
     }
-    override func mouseUp(with event: NSEvent) { dragActive = false }
+    override func mouseUp(with event: NSEvent) {
+        dragActive = false
+        if let origin = window?.frame.origin {
+            UserDefaults.standard.set([Double(origin.x), Double(origin.y)], forKey: "synctask_window_origin")
+        }
+    }
 }
 
 final class DesktopWidgetWindow: NSWindow {
@@ -1344,7 +1485,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        let frame = NSRect(x: 80, y: 420, width: 280, height: 320)
+        let size = NSSize(width: 280, height: 320)
+        var origin = NSPoint(x: 80, y: 420)
+        if let saved = UserDefaults.standard.array(forKey: "synctask_window_origin") as? [Double], saved.count == 2 {
+            origin = NSPoint(x: saved[0], y: saved[1])
+        }
+        if let screen = NSScreen.main {
+            let vf = screen.visibleFrame
+            let rect = NSRect(origin: origin, size: size)
+            let visible = NSScreen.screens.contains { !$0.visibleFrame.intersection(rect).isNull }
+            if !visible {
+                origin = NSPoint(
+                    x: max(vf.minX + 8, min(origin.x, vf.maxX - size.width - 8)),
+                    y: max(vf.minY + 8, min(origin.y, vf.maxY - size.height - 8))
+                )
+            }
+        }
+        let frame = NSRect(origin: origin, size: size)
         let win = DesktopWidgetWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
         win.isOpaque = false
         win.backgroundColor = .clear
@@ -1355,6 +1512,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.orderFrontRegardless()
         window = win
     }
+}
+
+// Single-instance lock
+let lockFD = open("/tmp/app.synctask.lock", O_CREAT | O_RDWR, 0o600)
+if lockFD >= 0 && flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+    close(lockFD)
+    fputs("syncTask is already running.\n", stderr)
+    exit(0)
 }
 
 let app = NSApplication.shared
